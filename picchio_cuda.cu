@@ -34,9 +34,10 @@ static char  g_name[256] = "";
 /* Bounded CUDA-pinned host slabs. Pageable memory remains the fallback. */
 static std::mutex g_host_reg_mutex;
 static std::unordered_map<void *, size_t> g_host_regs;
-static size_t g_host_reg_bytes = 0;
+static size_t g_host_reg_bytes = 0, g_host_reg_peak_bytes = 0;
 static uint64_t g_host_reg_ok = 0, g_host_reg_fail = 0;
 static const size_t G_HOST_REG_LIMIT = (size_t)128 * 1024 * 1024;
+static const uintptr_t G_HOST_REG_ALIGN_MASK = (uintptr_t)4095;
 
 #define CU_TRY(call) do {                                            \
         cudaError_t _e = (call);                                     \
@@ -265,11 +266,33 @@ extern "C" int pgpu_host_register(void *ptr, size_t bytes) {
     std::lock_guard<std::mutex> lock(g_host_reg_mutex);
     auto it = g_host_regs.find(ptr);
     if (it != g_host_regs.end()) return it->second >= bytes ? 1 : 0;
-    if (bytes > G_HOST_REG_LIMIT - g_host_reg_bytes) { g_host_reg_fail++; return 0; }
+
+    /* flat_aligned_alloc currently returns 4 KiB-aligned slabs. Reject any
+     * other pointer instead of asking CUDA to register an invalid range. */
+    if (((uintptr_t)ptr & G_HOST_REG_ALIGN_MASK) != 0 ||
+        bytes > G_HOST_REG_LIMIT - g_host_reg_bytes) {
+        g_host_reg_fail++;
+        return 0;
+    }
+
     cudaError_t e = cudaHostRegister(ptr, bytes, cudaHostRegisterPortable);
-    if (e != cudaSuccess) { g_host_reg_fail++; (void)cudaGetLastError(); return 0; }
-    g_host_regs.emplace(ptr, bytes);
+    if (e != cudaSuccess) {
+        g_host_reg_fail++;
+        (void)cudaGetLastError(); /* clear the runtime's sticky error state */
+        return 0;                 /* caller keeps using pageable memory */
+    }
+
+    /* If bookkeeping allocation fails, undo the CUDA registration immediately. */
+    try {
+        g_host_regs.emplace(ptr, bytes);
+    } catch (...) {
+        (void)cudaHostUnregister(ptr);
+        g_host_reg_fail++;
+        return 0;
+    }
     g_host_reg_bytes += bytes;
+    if (g_host_reg_bytes > g_host_reg_peak_bytes)
+        g_host_reg_peak_bytes = g_host_reg_bytes;
     g_host_reg_ok++;
     return 1;
 }
@@ -279,7 +302,13 @@ extern "C" void pgpu_host_unregister(void *ptr) {
     std::lock_guard<std::mutex> lock(g_host_reg_mutex);
     auto it = g_host_regs.find(ptr);
     if (it == g_host_regs.end()) return;
-    (void)cudaHostUnregister(ptr);
+    cudaError_t e = cudaHostUnregister(ptr);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "[gpu] cudaHostUnregister failed: %s\\n",
+                cudaGetErrorString(e));
+        (void)cudaGetLastError();
+        return;
+    }
     g_host_reg_bytes -= it->second;
     g_host_regs.erase(it);
 }
@@ -287,14 +316,22 @@ extern "C" void pgpu_host_unregister(void *ptr) {
 extern "C" void pgpu_shutdown(void) {
     {
         std::lock_guard<std::mutex> lock(g_host_reg_mutex);
-        for (auto &kv : g_host_regs) (void)cudaHostUnregister(kv.first);
+        for (auto &kv : g_host_regs) {
+            cudaError_t e = cudaHostUnregister(kv.first);
+            if (e != cudaSuccess) {
+                fprintf(stderr, "[gpu] shutdown cudaHostUnregister failed: %s\\n",
+                        cudaGetErrorString(e));
+                (void)cudaGetLastError();
+            }
+        }
         g_host_regs.clear();
         g_host_reg_bytes = 0;
     }
-    fprintf(stderr, "[gpu] pinned host slabs: %llu registered, %llu failed, cap 128 MiB\n",
-            (unsigned long long)g_host_reg_ok, (unsigned long long)g_host_reg_fail);
+    fprintf(stderr, "[gpu] pinned host slabs: %llu registered, %llu failed, peak %.1f MiB / 128 MiB cap\\n",
+            (unsigned long long)g_host_reg_ok, (unsigned long long)g_host_reg_fail,
+            g_host_reg_peak_bytes / 1048576.0);
     if (g_emiss + g_ehit > 0)
-        fprintf(stderr, "[gpu] expert VRAM cache: %llu hit / %llu miss (%.1f%%), %.2f GB resident\n",
+        fprintf(stderr, "[gpu] expert VRAM cache: %llu hit / %llu miss (%.1f%%), %.2f GB resident\\n",
                 (unsigned long long)g_ehit, (unsigned long long)g_emiss,
                 100.0 * g_ehit / (g_ehit + g_emiss), g_vram_used / 1e9);
     for (auto &kv : g_wcache)  { cudaFree(kv.second.w); cudaFree(kv.second.s); }

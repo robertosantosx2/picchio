@@ -304,7 +304,7 @@ extern "C" void pgpu_host_unregister(void *ptr) {
     if (it == g_host_regs.end()) return;
     cudaError_t e = cudaHostUnregister(ptr);
     if (e != cudaSuccess) {
-        fprintf(stderr, "[gpu] cudaHostUnregister failed: %s\\n",
+        fprintf(stderr, "[gpu] cudaHostUnregister failed: %s\n",
                 cudaGetErrorString(e));
         (void)cudaGetLastError();
         return;
@@ -319,7 +319,7 @@ extern "C" void pgpu_shutdown(void) {
         for (auto &kv : g_host_regs) {
             cudaError_t e = cudaHostUnregister(kv.first);
             if (e != cudaSuccess) {
-                fprintf(stderr, "[gpu] shutdown cudaHostUnregister failed: %s\\n",
+                fprintf(stderr, "[gpu] shutdown cudaHostUnregister failed: %s\n",
                         cudaGetErrorString(e));
                 (void)cudaGetLastError();
             }
@@ -327,11 +327,11 @@ extern "C" void pgpu_shutdown(void) {
         g_host_regs.clear();
         g_host_reg_bytes = 0;
     }
-    fprintf(stderr, "[gpu] pinned host slabs: %llu registered, %llu failed, peak %.1f MiB / 128 MiB cap\\n",
+    fprintf(stderr, "[gpu] pinned host slabs: %llu registered, %llu failed, peak %.1f MiB / 128 MiB cap\n",
             (unsigned long long)g_host_reg_ok, (unsigned long long)g_host_reg_fail,
             g_host_reg_peak_bytes / 1048576.0);
     if (g_emiss + g_ehit > 0)
-        fprintf(stderr, "[gpu] expert VRAM cache: %llu hit / %llu miss (%.1f%%), %.2f GB resident\\n",
+        fprintf(stderr, "[gpu] expert VRAM cache: %llu hit / %llu miss (%.1f%%), %.2f GB resident\n",
                 (unsigned long long)g_ehit, (unsigned long long)g_emiss,
                 100.0 * g_ehit / (g_ehit + g_emiss), g_vram_used / 1e9);
     for (auto &kv : g_wcache)  { cudaFree(kv.second.w); cudaFree(kv.second.s); }
@@ -580,7 +580,28 @@ extern "C" int pgpu_moe_resident(int layer, int eid) {
 /* ══════════════════════════════════════════════════════════════════════════
  *  STANDALONE NUMERIC SELF-TEST + MICROBENCH (nvcc -DPGPU_TEST)
  * ══════════════════════════════════════════════════════════════════════════ */
-#if defined(PGPU_ROUTER_TEST)
+#if defined(PGPU_PINNED_TEST)
+int main(void) {
+    if (!pgpu_init()) { fprintf(stderr, "no CUDA device\\n"); return 1; }
+    void *p = nullptr;
+    if (posix_memalign(&p, 4096, 4096) != 0 || !p) return 2;
+
+    int first = pgpu_host_register(p, 4096);
+    int duplicate = pgpu_host_register(p, 4096);
+    pgpu_host_unregister(p);
+    int again = pgpu_host_register(p, 4096);
+    int unaligned = pgpu_host_register((char *)p + 1, 4096);
+    int over_cap = pgpu_host_register(p, G_HOST_REG_LIMIT + 1);
+    pgpu_host_unregister(p);
+    pgpu_shutdown();
+    free(p);
+
+    int ok = first == 1 && duplicate == 1 && again == 1 &&
+             unaligned == 0 && over_cap == 0;
+    fprintf(stderr, "[gpu] pinned host self-test: %s\\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 3;
+}
+#elif defined(PGPU_ROUTER_TEST)
 int main(void) {
     if (!pgpu_init()) { fprintf(stderr, "no CUDA device\n"); return 1; }
     const int E = 128, D = 2880;

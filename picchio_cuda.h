@@ -46,8 +46,10 @@ PGPU_API int  pgpu_available(void);
 PGPU_API void pgpu_shutdown(void);
 
 /* Optional pageable-to-pinned registration for reusable host expert slabs.
- * Returns 1 when registered/already registered, 0 when pinning is unavailable.
- * Unregister must be called before the owning host allocation is freed. */
+ * The pointer must be 4 KiB aligned; the backend enforces a 128 MiB aggregate
+ * cap and returns 0 on failure so the caller can retain pageable memory.
+ * Repeated registration of the same pointer is idempotent. Unregister must be
+ * called before the owning host allocation is freed. Copies remain synchronous. */
 PGPU_API int  pgpu_host_register(void *ptr, size_t bytes);
 PGPU_API void pgpu_host_unregister(void *ptr);
 

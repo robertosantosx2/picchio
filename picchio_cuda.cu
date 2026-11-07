@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
+#include <mutex>
 
 #include "picchio_cuda.h"
 
@@ -29,6 +30,13 @@
 
 static int   g_ok = 0;          /* 1 once a device is initialized */
 static char  g_name[256] = "";
+
+/* Bounded CUDA-pinned host slabs. Pageable memory remains the fallback. */
+static std::mutex g_host_reg_mutex;
+static std::unordered_map<void *, size_t> g_host_regs;
+static size_t g_host_reg_bytes = 0;
+static uint64_t g_host_reg_ok = 0, g_host_reg_fail = 0;
+static const size_t G_HOST_REG_LIMIT = (size_t)128 * 1024 * 1024;
 
 #define CU_TRY(call) do {                                            \
         cudaError_t _e = (call);                                     \
@@ -252,7 +260,39 @@ extern "C" int pgpu_init(void) {
 
 extern "C" int pgpu_available(void) { return g_ok; }
 
+extern "C" int pgpu_host_register(void *ptr, size_t bytes) {
+    if (!g_ok || !ptr || bytes == 0) return 0;
+    std::lock_guard<std::mutex> lock(g_host_reg_mutex);
+    auto it = g_host_regs.find(ptr);
+    if (it != g_host_regs.end()) return it->second >= bytes ? 1 : 0;
+    if (bytes > G_HOST_REG_LIMIT - g_host_reg_bytes) { g_host_reg_fail++; return 0; }
+    cudaError_t e = cudaHostRegister(ptr, bytes, cudaHostRegisterPortable);
+    if (e != cudaSuccess) { g_host_reg_fail++; (void)cudaGetLastError(); return 0; }
+    g_host_regs.emplace(ptr, bytes);
+    g_host_reg_bytes += bytes;
+    g_host_reg_ok++;
+    return 1;
+}
+
+extern "C" void pgpu_host_unregister(void *ptr) {
+    if (!ptr) return;
+    std::lock_guard<std::mutex> lock(g_host_reg_mutex);
+    auto it = g_host_regs.find(ptr);
+    if (it == g_host_regs.end()) return;
+    (void)cudaHostUnregister(ptr);
+    g_host_reg_bytes -= it->second;
+    g_host_regs.erase(it);
+}
+
 extern "C" void pgpu_shutdown(void) {
+    {
+        std::lock_guard<std::mutex> lock(g_host_reg_mutex);
+        for (auto &kv : g_host_regs) (void)cudaHostUnregister(kv.first);
+        g_host_regs.clear();
+        g_host_reg_bytes = 0;
+    }
+    fprintf(stderr, "[gpu] pinned host slabs: %llu registered, %llu failed, cap 128 MiB\n",
+            (unsigned long long)g_host_reg_ok, (unsigned long long)g_host_reg_fail);
     if (g_emiss + g_ehit > 0)
         fprintf(stderr, "[gpu] expert VRAM cache: %llu hit / %llu miss (%.1f%%), %.2f GB resident\n",
                 (unsigned long long)g_ehit, (unsigned long long)g_emiss,

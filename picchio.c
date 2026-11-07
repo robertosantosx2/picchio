@@ -76,6 +76,8 @@ typedef int  (*pgpu_moe_t)(float *, const float *, int, int, int,
                            const PgpuExpert *, const float *, int, int,
                            int, int, float, float);
 typedef int  (*pgpu_moe_resident_t)(int, int);  /* 1 if (layer,eid) is in VRAM */
+typedef int  (*pgpu_host_register_t)(void *, size_t);
+typedef void (*pgpu_host_unregister_t)(void *);
 #include "gpu_router_native.h"
 static pgpu_shutdown_t g_pgpu_shutdown = NULL;
 static pgpu_i8_t       g_pgpu_i8 = NULL;    /* lm_head (opt-in: GPU_LMHEAD=1) */
@@ -83,6 +85,8 @@ static pgpu_router_upload_t g_pgpu_router_upload = NULL;
 static pgpu_router_scores_t g_pgpu_router_scores = NULL;
 static pgpu_moe_t      g_pgpu_moe = NULL;   /* experts (the G2 win) */
 static pgpu_moe_resident_t g_pgpu_moe_resident = NULL; /* skip disk for VRAM-resident */
+static pgpu_host_register_t g_pgpu_host_register = NULL;
+static pgpu_host_unregister_t g_pgpu_host_unregister = NULL;
 static int             g_gpu_backend = 0;
 static int             g_gpu_router = 0;    /* resident routers + score kernel */
 static int             g_gpu_dense = 0;     /* resident FP16 Q/K/V/O projections */
@@ -1331,6 +1335,7 @@ static void slot_wait_ready(ESlot *s) {
 
 static void free_slot_buffers(ESlot *s) {
     if (s->slab) {
+        if (g_pgpu_host_unregister) g_pgpu_host_unregister(s->slab);
         flat_aligned_free(s->slab); s->slab = NULL;
         s->gu.qf = NULL; s->gu.q4 = NULL; s->gu.s = NULL;
         s->d.qf = NULL; s->d.q4 = NULL; s->d.s = NULL;
@@ -2249,6 +2254,8 @@ static void moe_forward(float *out, const float *x, Model *m,
                 es->gu.block_size <= 0 || es->gu.block_size != es->d.block_size) {
                 ok = 0; break;
             }
+            if (es->slab && g_pgpu_host_register)
+                (void)g_pgpu_host_register(es->slab, (size_t)es->slab_cap);
             bs = es->gu.block_size;
             ge[k].gu_q4 = es->gu.q4; ge[k].gu_s = es->gu.s; ge[k].gu_bias = es->gu_bias;
             ge[k].d_q4  = es->d.q4;  ge[k].d_s  = es->d.s;  ge[k].d_bias  = es->d_bias;
@@ -2767,6 +2774,10 @@ static void gpu_backend_load(Model *m) {
     pgpu_moe_t  moe  = (pgpu_moe_t)(uintptr_t)gpu_sym(lib, "pgpu_moe_layer");
     pgpu_moe_resident_t mres = (pgpu_moe_resident_t)(uintptr_t)
                                gpu_sym(lib, "pgpu_moe_resident");
+    g_pgpu_host_register = (pgpu_host_register_t)(uintptr_t)
+                           gpu_sym(lib, "pgpu_host_register");
+    g_pgpu_host_unregister = (pgpu_host_unregister_t)(uintptr_t)
+                             gpu_sym(lib, "pgpu_host_unregister");
     pgpu_i8_t   i8   = (pgpu_i8_t)(uintptr_t)gpu_sym(lib, "pgpu_matmul_i8");
     pgpu_router_upload_t rup = (pgpu_router_upload_t)(uintptr_t)
                               gpu_sym(lib, "pgpu_router_upload");

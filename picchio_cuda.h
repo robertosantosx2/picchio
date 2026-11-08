@@ -20,6 +20,7 @@
 #define PICCHIO_CUDA_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 /* Export macro: only the DLL build (nvcc -DPGPU_BUILD_DLL) exports the symbols.
  * The engine never includes this with the macro set — it resolves the entry
@@ -41,8 +42,16 @@ PGPU_API int  pgpu_init(void);
 /* 1 if pgpu_init succeeded and the GPU path is active; 0 otherwise. */
 PGPU_API int  pgpu_available(void);
 
-/* Free all device buffers and the resident-weight cache. */
+/* Free all device buffers, pinned host registrations and the resident-weight cache. */
 PGPU_API void pgpu_shutdown(void);
+
+/* Optional pageable-to-pinned registration for reusable host expert slabs.
+ * The pointer must be 4 KiB aligned; the backend enforces a 128 MiB aggregate
+ * cap and returns 0 on failure so the caller can retain pageable memory.
+ * Repeated registration of the same pointer is idempotent. Unregister must be
+ * called before the owning host allocation is freed. Copies remain synchronous. */
+PGPU_API int  pgpu_host_register(void *ptr, size_t bytes);
+PGPU_API void pgpu_host_unregister(void *ptr);
 
 /* y[O] = scale[o] * sum_i x[i] * w[o*I + i]     (w INT8, per-row scale)
  * `weight_id` is an opaque, stable key (typically the host weight pointer): the

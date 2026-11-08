@@ -1,0 +1,62 @@
+name: Picchio CUDA compile
+
+on:
+  push:
+    branches: ["feature/**"]
+  pull_request:
+    branches: ["main", "feature/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cuda-compile-sm86:
+    name: CUDA compile (sm_86, no GPU execution)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Compile runtime shared library
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/workspace" -w /workspace \
+            nvidia/cuda:13.4.3-devel-ubuntu24.04 \
+            nvcc -std=c++14 -O2 -arch=sm_86 -Xcompiler=-fPIC \
+              -shared -o /tmp/libpicchio_cuda.so picchio_cuda.cu
+
+      - name: Compile pinned-host self-test
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/workspace" -w /workspace \
+            nvidia/cuda:13.4.3-devel-ubuntu24.04 \
+            nvcc -std=c++14 -O2 -arch=sm_86 -DPGPU_PINNED_TEST \
+              -o /tmp/pgpu_pinned_test picchio_cuda.cu
+
+      - name: Compile router numeric self-test
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/workspace" -w /workspace \
+            nvidia/cuda:13.4.3-devel-ubuntu24.04 \
+            nvcc -std=c++14 -O2 -arch=sm_86 -DPGPU_ROUTER_TEST \
+              -o /tmp/pgpu_router_test picchio_cuda.cu
+
+      - name: Verify explicit-stream invariants
+        run: |
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          source = Path("picchio_cuda.cu").read_text()
+          if re.search(r"\bcudaMemcpy\s*\(", source):
+              raise SystemExit("legacy synchronous cudaMemcpy call remains")
+          launches = [line.strip() for line in source.splitlines() if "<<<" in line]
+          bad = [line for line in launches if "g_compute_stream" not in line]
+          if bad:
+              raise SystemExit("kernel launch without explicit compute stream: " + repr(bad))
+          for token in ("cudaStreamCreateWithFlags", "cudaStreamSynchronize", "cudaMemcpyAsync"):
+              if token not in source:
+                  raise SystemExit("missing stream primitive: " + token)
+          print(f"explicit-stream static checks: PASS ({len(launches)} kernel launch sites)")
+          PY
+
+      - name: Check patch whitespace
+        run: git diff --check

@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
+#include <mutex>
 
 #include "picchio_cuda.h"
 
@@ -29,6 +30,30 @@
 
 static int   g_ok = 0;          /* 1 once a device is initialized */
 static char  g_name[256] = "";
+
+/* Bounded CUDA-pinned host slabs. Pageable memory remains the fallback. */
+static std::mutex g_host_reg_mutex;
+static std::unordered_map<void *, size_t> g_host_regs;
+static size_t g_host_reg_bytes = 0, g_host_reg_peak_bytes = 0;
+static uint64_t g_host_reg_ok = 0, g_host_reg_fail = 0;
+static uint64_t g_host_reg_align_fail = 0;
+static uint64_t g_host_reg_cap_fail = 0;
+static uint64_t g_host_reg_cuda_fail = 0;
+static uint64_t g_host_reg_bookkeeping_fail = 0;
+static uint64_t g_host_reg_attempts = 0;
+static uint64_t g_host_reg_attempt_bytes = 0;
+static uint64_t g_host_reg_cap_fail_bytes = 0;
+static size_t g_host_reg_min_attempt = (size_t)-1;
+static size_t g_host_reg_max_attempt = 0;
+static cudaError_t g_host_reg_last_cuda_error = cudaSuccess;
+static const size_t G_HOST_REG_LIMIT = (size_t)128 * 1024 * 1024;
+
+/* Overflow-safe aggregate pinned-memory budget check. */
+static int host_reg_fits(size_t used, size_t bytes) {
+    return used <= G_HOST_REG_LIMIT &&
+           bytes <= G_HOST_REG_LIMIT - used;
+}
+static const uintptr_t G_HOST_REG_ALIGN_MASK = (uintptr_t)4095;
 
 #define CU_TRY(call) do {                                            \
         cudaError_t _e = (call);                                     \
@@ -252,7 +277,105 @@ extern "C" int pgpu_init(void) {
 
 extern "C" int pgpu_available(void) { return g_ok; }
 
+extern "C" int pgpu_host_register(void *ptr, size_t bytes) {
+    if (!g_ok || !ptr || bytes == 0) return 0;
+    std::lock_guard<std::mutex> lock(g_host_reg_mutex);
+    auto it = g_host_regs.find(ptr);
+    if (it != g_host_regs.end()) return it->second >= bytes ? 1 : 0;
+
+    /* Record each new slab registration request to guide cap sizing. */
+    g_host_reg_attempts++;
+    g_host_reg_attempt_bytes += (uint64_t)bytes;
+    if (bytes < g_host_reg_min_attempt) g_host_reg_min_attempt = bytes;
+    if (bytes > g_host_reg_max_attempt) g_host_reg_max_attempt = bytes;
+
+    /* flat_aligned_alloc currently returns 4 KiB-aligned slabs. Reject any
+     * other pointer instead of asking CUDA to register an invalid range. */
+    if (((uintptr_t)ptr & G_HOST_REG_ALIGN_MASK) != 0) {
+        g_host_reg_fail++;
+        g_host_reg_align_fail++;
+        return 0;
+    }
+    if (!host_reg_fits(g_host_reg_bytes, bytes)) {
+        g_host_reg_fail++;
+        g_host_reg_cap_fail++;
+        g_host_reg_cap_fail_bytes += (uint64_t)bytes;
+        return 0;
+    }
+
+    cudaError_t e = cudaHostRegister(ptr, bytes, cudaHostRegisterPortable);
+    if (e != cudaSuccess) {
+        g_host_reg_fail++;
+        g_host_reg_cuda_fail++;
+        g_host_reg_last_cuda_error = e;
+        (void)cudaGetLastError(); /* clear the runtime's sticky error state */
+        return 0;                 /* caller keeps using pageable memory */
+    }
+
+    /* If bookkeeping allocation fails, undo the CUDA registration immediately. */
+    try {
+        g_host_regs.emplace(ptr, bytes);
+    } catch (...) {
+        (void)cudaHostUnregister(ptr);
+        g_host_reg_fail++;
+        g_host_reg_bookkeeping_fail++;
+        return 0;
+    }
+    g_host_reg_bytes += bytes;
+    if (g_host_reg_bytes > g_host_reg_peak_bytes)
+        g_host_reg_peak_bytes = g_host_reg_bytes;
+    g_host_reg_ok++;
+    return 1;
+}
+
+extern "C" void pgpu_host_unregister(void *ptr) {
+    if (!ptr) return;
+    std::lock_guard<std::mutex> lock(g_host_reg_mutex);
+    auto it = g_host_regs.find(ptr);
+    if (it == g_host_regs.end()) return;
+    cudaError_t e = cudaHostUnregister(ptr);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "[gpu] cudaHostUnregister failed: %s\n",
+                cudaGetErrorString(e));
+        (void)cudaGetLastError();
+        return;
+    }
+    g_host_reg_bytes -= it->second;
+    g_host_regs.erase(it);
+}
+
 extern "C" void pgpu_shutdown(void) {
+    {
+        std::lock_guard<std::mutex> lock(g_host_reg_mutex);
+        for (auto &kv : g_host_regs) {
+            cudaError_t e = cudaHostUnregister(kv.first);
+            if (e != cudaSuccess) {
+                fprintf(stderr, "[gpu] shutdown cudaHostUnregister failed: %s\n",
+                        cudaGetErrorString(e));
+                (void)cudaGetLastError();
+            }
+        }
+        g_host_regs.clear();
+        g_host_reg_bytes = 0;
+    }
+    fprintf(stderr, "[gpu] pinned host slabs: %llu registered, %llu failed, peak %.1f MiB / 128 MiB cap\n",
+            (unsigned long long)g_host_reg_ok, (unsigned long long)g_host_reg_fail,
+            g_host_reg_peak_bytes / 1048576.0);
+    fprintf(stderr, "[gpu] pinned failures: cap=%llu align=%llu cuda=%llu bookkeeping=%llu\n",
+            (unsigned long long)g_host_reg_cap_fail,
+            (unsigned long long)g_host_reg_align_fail,
+            (unsigned long long)g_host_reg_cuda_fail,
+            (unsigned long long)g_host_reg_bookkeeping_fail);
+    if (g_host_reg_attempts > 0)
+        fprintf(stderr, "[gpu] pinned requests: %llu slabs, %.1f MiB total, min %.1f MiB, max %.1f MiB; cap-blocked %.1f MiB\n",
+                (unsigned long long)g_host_reg_attempts,
+                g_host_reg_attempt_bytes / 1048576.0,
+                g_host_reg_min_attempt / 1048576.0,
+                g_host_reg_max_attempt / 1048576.0,
+                g_host_reg_cap_fail_bytes / 1048576.0);
+    if (g_host_reg_last_cuda_error != cudaSuccess)
+        fprintf(stderr, "[gpu] last cudaHostRegister error: %s\n",
+                cudaGetErrorString(g_host_reg_last_cuda_error));
     if (g_emiss + g_ehit > 0)
         fprintf(stderr, "[gpu] expert VRAM cache: %llu hit / %llu miss (%.1f%%), %.2f GB resident\n",
                 (unsigned long long)g_ehit, (unsigned long long)g_emiss,
@@ -503,7 +626,34 @@ extern "C" int pgpu_moe_resident(int layer, int eid) {
 /* ══════════════════════════════════════════════════════════════════════════
  *  STANDALONE NUMERIC SELF-TEST + MICROBENCH (nvcc -DPGPU_TEST)
  * ══════════════════════════════════════════════════════════════════════════ */
-#if defined(PGPU_ROUTER_TEST)
+#if defined(PGPU_PINNED_TEST)
+int main(void) {
+    if (!pgpu_init()) { fprintf(stderr, "no CUDA device\n"); return 1; }
+    void *p = nullptr;
+    if (posix_memalign(&p, 4096, 4096) != 0 || !p) return 2;
+
+    int first = pgpu_host_register(p, 4096);
+    int duplicate = pgpu_host_register(p, 4096);
+    pgpu_host_unregister(p);
+    int again = pgpu_host_register(p, 4096);
+    int unaligned = pgpu_host_register((char *)p + 1, 4096);
+    int over_cap = pgpu_host_register(p, G_HOST_REG_LIMIT + 1);
+    int exact_cap = host_reg_fits(0, G_HOST_REG_LIMIT);
+    int cap_plus_one = !host_reg_fits(0, G_HOST_REG_LIMIT + 1);
+    int used_at_cap = !host_reg_fits(G_HOST_REG_LIMIT, 1);
+    int used_over_cap = !host_reg_fits(G_HOST_REG_LIMIT + 1, 0);
+    int size_overflow = !host_reg_fits(0, (size_t)-1);
+    pgpu_host_unregister(p);
+    pgpu_shutdown();
+    free(p);
+
+    int ok = first == 1 && duplicate == 1 && again == 1 &&
+             unaligned == 0 && over_cap == 0 && exact_cap &&
+             cap_plus_one && used_at_cap && used_over_cap && size_overflow;
+    fprintf(stderr, "[gpu] pinned host self-test: %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 3;
+}
+#elif defined(PGPU_ROUTER_TEST)
 int main(void) {
     if (!pgpu_init()) { fprintf(stderr, "no CUDA device\n"); return 1; }
     const int E = 128, D = 2880;

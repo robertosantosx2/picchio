@@ -46,7 +46,7 @@ jobs:
           import re
           from pathlib import Path
           source = Path("picchio_cuda.cu").read_text()
-          if re.search(r"\\bcudaMemcpy\\s*\\(", source):
+          if re.search(r"\bcudaMemcpy\s*\(", source):
               raise SystemExit("legacy synchronous cudaMemcpy call remains")
           launches = [line.strip() for line in source.splitlines() if "<<<" in line]
           bad = [line for line in launches if "g_compute_stream" not in line]

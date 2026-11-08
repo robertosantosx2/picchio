@@ -1336,8 +1336,19 @@ static void slot_wait_ready(ESlot *s) {
 
 static void free_slot_buffers(ESlot *s) {
     if (s->slab) {
-        if (s->slab_cuda_pinned == 1 && g_pgpu_host_unregister)
+        if (s->slab_cuda_pinned == 1) {
+            /* A pinned slab must never be freed unless the CUDA backend can
+             * confirm unregister. The backend fail-stops on uncertain drain
+             * or unregister; a missing callback is equally unsafe here. */
+            if (!g_pgpu_host_unregister) {
+                fprintf(stderr,
+                        "[gpu] FATAL: pinned expert slab has no unregister callback; "
+                        "aborting before host free\\n");
+                fflush(stderr);
+                abort();
+            }
             g_pgpu_host_unregister(s->slab);
+        }
         s->slab_cuda_pinned = 0;
         flat_aligned_free(s->slab); s->slab = NULL;
         s->gu.qf = NULL; s->gu.q4 = NULL; s->gu.s = NULL;

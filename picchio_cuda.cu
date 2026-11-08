@@ -628,7 +628,7 @@ extern "C" int pgpu_moe_resident(int layer, int eid) {
  * ══════════════════════════════════════════════════════════════════════════ */
 #if defined(PGPU_PINNED_TEST)
 int main(void) {
-    if (!pgpu_init()) { fprintf(stderr, "no CUDA device\\n"); return 1; }
+    if (!pgpu_init()) { fprintf(stderr, "no CUDA device\n"); return 1; }
     void *p = nullptr;
     if (posix_memalign(&p, 4096, 4096) != 0 || !p) return 2;
 
@@ -638,13 +638,19 @@ int main(void) {
     int again = pgpu_host_register(p, 4096);
     int unaligned = pgpu_host_register((char *)p + 1, 4096);
     int over_cap = pgpu_host_register(p, G_HOST_REG_LIMIT + 1);
+    int exact_cap = host_reg_fits(0, G_HOST_REG_LIMIT);
+    int cap_plus_one = !host_reg_fits(0, G_HOST_REG_LIMIT + 1);
+    int used_at_cap = !host_reg_fits(G_HOST_REG_LIMIT, 1);
+    int used_over_cap = !host_reg_fits(G_HOST_REG_LIMIT + 1, 0);
+    int size_overflow = !host_reg_fits(0, (size_t)-1);
     pgpu_host_unregister(p);
     pgpu_shutdown();
     free(p);
 
     int ok = first == 1 && duplicate == 1 && again == 1 &&
-             unaligned == 0 && over_cap == 0;
-    fprintf(stderr, "[gpu] pinned host self-test: %s\\n", ok ? "PASS" : "FAIL");
+             unaligned == 0 && over_cap == 0 && exact_cap &&
+             cap_plus_one && used_at_cap && used_over_cap && size_overflow;
+    fprintf(stderr, "[gpu] pinned host self-test: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 3;
 }
 #elif defined(PGPU_ROUTER_TEST)

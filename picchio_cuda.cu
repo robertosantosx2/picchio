@@ -30,6 +30,33 @@
 
 static int   g_ok = 0;          /* 1 once a device is initialized */
 static char  g_name[256] = "";
+static cudaStream_t g_compute_stream = nullptr;
+
+/* P1a keeps the public C API synchronous while making stream ordering explicit.
+ * No host buffer or device allocation may be released before this stream drains. */
+static int stream_wait(const char *where) {
+    if (!g_compute_stream) return -1;
+    cudaError_t e = cudaStreamSynchronize(g_compute_stream);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "[gpu] %s stream synchronize failed: %s\n",
+                where, cudaGetErrorString(e));
+        (void)cudaGetLastError();
+        return -1;
+    }
+    return 0;
+}
+static cudaError_t stream_copy(void *dst, const void *src, size_t bytes,
+                              cudaMemcpyKind kind, const char *where) {
+    cudaError_t e = cudaMemcpyAsync(dst, src, bytes, kind, g_compute_stream);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "[gpu] %s async copy enqueue failed: %s\n",
+                where, cudaGetErrorString(e));
+        (void)stream_wait(where);
+        (void)cudaGetLastError();
+        return e;
+    }
+    return cudaSuccess;
+}
 
 /* Bounded CUDA-pinned host slabs. Pageable memory remains the fallback. */
 static std::mutex g_host_reg_mutex;
@@ -60,6 +87,7 @@ static const uintptr_t G_HOST_REG_ALIGN_MASK = (uintptr_t)4095;
         if (_e != cudaSuccess) {                                     \
             fprintf(stderr, "[gpu] %s failed: %s\n", #call,          \
                     cudaGetErrorString(_e));                         \
+            (void)stream_wait(#call);                                \
             return -1;                                               \
         }                                                            \
     } while (0)
@@ -252,6 +280,7 @@ static int ensure(void **buf, size_t *cap, size_t need) {
 /* ── C API ──────────────────────────────────────────────────────────────── */
 
 extern "C" int pgpu_init(void) {
+    if (g_ok) return 1;
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n <= 0) return 0;
     if (cudaSetDevice(0) != cudaSuccess) return 0;
@@ -271,6 +300,13 @@ extern "C" int pgpu_init(void) {
     g_vram_budget = (size_t)(gb * 1e9);
     fprintf(stderr, "[gpu] expert VRAM budget: %.2f GB\n", g_vram_budget / 1e9);
 
+    cudaError_t se = cudaStreamCreateWithFlags(&g_compute_stream, cudaStreamNonBlocking);
+    if (se != cudaSuccess) {
+        fprintf(stderr, "[gpu] compute stream creation failed: %s\n", cudaGetErrorString(se));
+        (void)cudaGetLastError();
+        g_compute_stream = nullptr;
+        return 0;
+    }
     g_ok = 1;
     return 1;
 }
@@ -333,6 +369,7 @@ extern "C" void pgpu_host_unregister(void *ptr) {
     std::lock_guard<std::mutex> lock(g_host_reg_mutex);
     auto it = g_host_regs.find(ptr);
     if (it == g_host_regs.end()) return;
+    (void)stream_wait("host unregister");
     cudaError_t e = cudaHostUnregister(ptr);
     if (e != cudaSuccess) {
         fprintf(stderr, "[gpu] cudaHostUnregister failed: %s\n",
@@ -345,6 +382,7 @@ extern "C" void pgpu_host_unregister(void *ptr) {
 }
 
 extern "C" void pgpu_shutdown(void) {
+    (void)stream_wait("shutdown");
     {
         std::lock_guard<std::mutex> lock(g_host_reg_mutex);
         for (auto &kv : g_host_regs) {
@@ -396,6 +434,12 @@ extern "C" void pgpu_shutdown(void) {
     g_dx = g_dy = g_dgu = g_dh = g_deo = g_dout = nullptr; g_ds = nullptr; g_dq4 = nullptr;
     g_dx_cap = g_dy_cap = g_dq4_cap = g_ds_cap = 0;
     g_dgu_cap = g_dh_cap = g_deo_cap = g_dout_cap = 0;
+    if (g_compute_stream) {
+        cudaError_t e = cudaStreamDestroy(g_compute_stream);
+        if (e != cudaSuccess)
+            fprintf(stderr, "[gpu] compute stream destroy failed: %s\n", cudaGetErrorString(e));
+        g_compute_stream = nullptr;
+    }
     g_ok = 0;
 }
 
@@ -412,8 +456,9 @@ extern "C" int pgpu_matmul_i8(float *y, const float *x,
         if (cudaMalloc(&dw.s, (size_t)O * sizeof(float)) != cudaSuccess) {
             cudaFree(dw.w); return -1;
         }
-        if (cudaMemcpy(dw.w, w, (size_t)O * I, cudaMemcpyHostToDevice) != cudaSuccess ||
-            cudaMemcpy(dw.s, scale, (size_t)O * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) {
+        if (stream_copy(dw.w, w, (size_t)O * I, cudaMemcpyHostToDevice, "lm_head weights") != 0 ||
+            stream_copy(dw.s, scale, (size_t)O * sizeof(float), cudaMemcpyHostToDevice, "lm_head scales") != 0 ||
+            stream_wait("lm_head weight upload") != 0) {
             cudaFree(dw.w); cudaFree(dw.s); return -1;
         }
         g_wcache[weight_id] = dw;
@@ -422,12 +467,12 @@ extern "C" int pgpu_matmul_i8(float *y, const float *x,
 
     if (ensure((void **)&g_dx, &g_dx_cap, (size_t)I * sizeof(float)) != 0) return -1;
     if (ensure((void **)&g_dy, &g_dy_cap, (size_t)O * sizeof(float)) != 0) return -1;
-    CU_TRY(cudaMemcpy(g_dx, x, (size_t)I * sizeof(float), cudaMemcpyHostToDevice));
+    CU_TRY(stream_copy(g_dx, x, (size_t)I * sizeof(float), cudaMemcpyHostToDevice, "lm_head input"));
 
-    lm_head_i8<<<O, 128>>>(it->second.w, it->second.s, g_dx, g_dy, O, I);
+    lm_head_i8<<<O, 128, 0, g_compute_stream>>>(it->second.w, it->second.s, g_dx, g_dy, O, I);
     CU_TRY(cudaGetLastError());
-    CU_TRY(cudaMemcpy(y, g_dy, (size_t)O * sizeof(float), cudaMemcpyDeviceToHost));
-    return 0;
+    CU_TRY(stream_copy(y, g_dy, (size_t)O * sizeof(float), cudaMemcpyDeviceToHost, "matmul output"));
+    return stream_wait("matmul output");
 }
 
 extern "C" int pgpu_router_upload(const float *w, const float *bias,
@@ -440,10 +485,9 @@ extern "C" int pgpu_router_upload(const float *w, const float *bias,
     if (bias && cudaMalloc(&r.bias, (size_t)E * sizeof(float)) != cudaSuccess) {
         cudaFree(r.w); return -1;
     }
-    if (cudaMemcpy(r.w, w, (size_t)E * D * sizeof(float),
-                   cudaMemcpyHostToDevice) != cudaSuccess ||
-        (bias && cudaMemcpy(r.bias, bias, (size_t)E * sizeof(float),
-                            cudaMemcpyHostToDevice) != cudaSuccess)) {
+    if (stream_copy(r.w, w, (size_t)E * D * sizeof(float), cudaMemcpyHostToDevice, "router weights") != 0 ||
+        (bias && stream_copy(r.bias, bias, (size_t)E * sizeof(float), cudaMemcpyHostToDevice, "router bias") != 0) ||
+        stream_wait("router upload") != 0) {
         cudaFree(r.w); cudaFree(r.bias); return -1;
     }
     g_rcache.emplace(weight_id, r);
@@ -459,11 +503,11 @@ extern "C" int pgpu_router_scores(float *scores, const float *x,
     if (it == g_rcache.end() || it->second.E != E || it->second.D != D) return -1;
     if (ensure((void **)&g_dx, &g_dx_cap, (size_t)D * sizeof(float)) != 0) return -1;
     if (ensure((void **)&g_dy, &g_dy_cap, (size_t)E * sizeof(float)) != 0) return -1;
-    CU_TRY(cudaMemcpy(g_dx, x, (size_t)D * sizeof(float), cudaMemcpyHostToDevice));
-    router_f32<<<E, 256>>>(it->second.w, it->second.bias, g_dx, g_dy, E, D);
+    CU_TRY(stream_copy(g_dx, x, (size_t)D * sizeof(float), cudaMemcpyHostToDevice, "router input"));
+    router_f32<<<E, 256, 0, g_compute_stream>>>(it->second.w, it->second.bias, g_dx, g_dy, E, D);
     CU_TRY(cudaGetLastError());
-    CU_TRY(cudaMemcpy(scores, g_dy, (size_t)E * sizeof(float), cudaMemcpyDeviceToHost));
-    return 0;
+    CU_TRY(stream_copy(scores, g_dy, (size_t)E * sizeof(float), cudaMemcpyDeviceToHost, "router scores"));
+    return stream_wait("router scores");
 }
 
 extern "C" int pgpu_matmul_i4gs(float *y, const float *x,
@@ -478,15 +522,15 @@ extern "C" int pgpu_matmul_i4gs(float *y, const float *x,
     if (ensure((void **)&g_dq4, &g_dq4_cap, (size_t)O * rb) != 0) return -1;
     if (ensure((void **)&g_ds,  &g_ds_cap,  (size_t)O * ng * sizeof(float)) != 0) return -1;
 
-    CU_TRY(cudaMemcpy(g_dx,  x,     (size_t)I * sizeof(float),      cudaMemcpyHostToDevice));
-    CU_TRY(cudaMemcpy(g_dq4, q4,    (size_t)O * rb,                 cudaMemcpyHostToDevice));
-    CU_TRY(cudaMemcpy(g_ds,  scale, (size_t)O * ng * sizeof(float), cudaMemcpyHostToDevice));
+    CU_TRY(stream_copy(g_dx, x, (size_t)I * sizeof(float), cudaMemcpyHostToDevice, "expert input"));
+    CU_TRY(stream_copy(g_dq4, q4, (size_t)O * rb, cudaMemcpyHostToDevice, "INT4 weights"));
+    CU_TRY(stream_copy(g_ds, scale, (size_t)O * ng * sizeof(float), cudaMemcpyHostToDevice, "expert scales"));
 
     int threads = 128, blocks = (O + threads - 1) / threads;
-    expert_i4gs<<<blocks, threads>>>(g_dq4, g_ds, g_dx, g_dy, O, I, gs);
+    expert_i4gs<<<blocks, threads, 0, g_compute_stream>>>(g_dq4, g_ds, g_dx, g_dy, O, I, gs);
     CU_TRY(cudaGetLastError());
-    CU_TRY(cudaMemcpy(y, g_dy, (size_t)O * sizeof(float), cudaMemcpyDeviceToHost));
-    return 0;
+    CU_TRY(stream_copy(y, g_dy, (size_t)O * sizeof(float), cudaMemcpyDeviceToHost, "matmul output"));
+    return stream_wait("matmul output");
 }
 
 extern "C" int pgpu_matmul_i3gs(float *y, const float *x,
@@ -501,15 +545,15 @@ extern "C" int pgpu_matmul_i3gs(float *y, const float *x,
     if (ensure((void **)&g_dq4, &g_dq4_cap, qbytes) != 0) return -1;
     if (ensure((void **)&g_ds,  &g_ds_cap,  (size_t)O * ng * sizeof(float)) != 0) return -1;
 
-    CU_TRY(cudaMemcpy(g_dx,  x,     (size_t)I * sizeof(float),      cudaMemcpyHostToDevice));
-    CU_TRY(cudaMemcpy(g_dq4, q3,    qbytes,                         cudaMemcpyHostToDevice));
-    CU_TRY(cudaMemcpy(g_ds,  scale, (size_t)O * ng * sizeof(float), cudaMemcpyHostToDevice));
+    CU_TRY(stream_copy(g_dx, x, (size_t)I * sizeof(float), cudaMemcpyHostToDevice, "expert input"));
+    CU_TRY(stream_copy(g_dq4, q3, qbytes, cudaMemcpyHostToDevice, "INT3 weights"));
+    CU_TRY(stream_copy(g_ds, scale, (size_t)O * ng * sizeof(float), cudaMemcpyHostToDevice, "expert scales"));
 
     int threads = 128, blocks = (O + threads - 1) / threads;
-    expert_i3gs<<<blocks, threads>>>(g_dq4, g_ds, g_dx, g_dy, O, I);
+    expert_i3gs<<<blocks, threads, 0, g_compute_stream>>>(g_dq4, g_ds, g_dx, g_dy, O, I);
     CU_TRY(cudaGetLastError());
-    CU_TRY(cudaMemcpy(y, g_dy, (size_t)O * sizeof(float), cudaMemcpyDeviceToHost));
-    return 0;
+    CU_TRY(stream_copy(y, g_dy, (size_t)O * sizeof(float), cudaMemcpyDeviceToHost, "matmul output"));
+    return stream_wait("matmul output");
 }
 
 /* Resolve an expert in the VRAM cache, uploading (and evicting LRU) on a miss.
@@ -533,6 +577,7 @@ static DevExpert *get_expert(uint64_t key, const PgpuExpert *e,
         auto victim = g_ecache.begin();
         for (auto i = g_ecache.begin(); i != g_ecache.end(); ++i)
             if (i->second.used < victim->second.used) victim = i;
+        if (stream_wait("expert eviction") != 0) return NULL;
         g_vram_used -= victim->second.bytes;
         free_dev_expert(victim->second);
         g_ecache.erase(victim);
@@ -546,14 +591,16 @@ static DevExpert *get_expert(uint64_t key, const PgpuExpert *e,
     if (ok && e->gu_bias) ok = cudaMalloc(&de.gu_bias, gu_bb) == cudaSuccess;
     if (ok && e->d_bias)  ok = cudaMalloc(&de.d_bias,  d_bb)  == cudaSuccess;
     if (ok)
-        ok = cudaMemcpy(de.gu,   e->gu_q4, gu_wb, cudaMemcpyHostToDevice) == cudaSuccess
-          && cudaMemcpy(de.gu_s, e->gu_s,  gu_sb, cudaMemcpyHostToDevice) == cudaSuccess
-          && cudaMemcpy(de.d,    e->d_q4,  d_wb,  cudaMemcpyHostToDevice) == cudaSuccess
-          && cudaMemcpy(de.d_s,  e->d_s,   d_sb,  cudaMemcpyHostToDevice) == cudaSuccess;
+        ok = stream_copy(de.gu, e->gu_q4, gu_wb, cudaMemcpyHostToDevice, "expert gate weights") == 0
+          && stream_copy(de.gu_s, e->gu_s, gu_sb, cudaMemcpyHostToDevice, "expert gate scales") == 0
+          && stream_copy(de.d, e->d_q4, d_wb, cudaMemcpyHostToDevice, "expert down weights") == 0
+          && stream_copy(de.d_s, e->d_s, d_sb, cudaMemcpyHostToDevice, "expert down scales") == 0;
     if (ok && e->gu_bias)
-        ok = cudaMemcpy(de.gu_bias, e->gu_bias, gu_bb, cudaMemcpyHostToDevice) == cudaSuccess;
+        ok = stream_copy(de.gu_bias, e->gu_bias, gu_bb, cudaMemcpyHostToDevice, "expert gate bias") == 0;
     if (ok && e->d_bias)
-        ok = cudaMemcpy(de.d_bias,  e->d_bias,  d_bb,  cudaMemcpyHostToDevice) == cudaSuccess;
+        ok = stream_copy(de.d_bias, e->d_bias, d_bb, cudaMemcpyHostToDevice, "expert down bias") == 0;
+    if (ok) ok = stream_wait("expert upload") == 0;
+    else (void)stream_wait("partial expert upload");
     if (!ok) { free_dev_expert(de); return NULL; }
 
     g_vram_used += need;
@@ -582,8 +629,8 @@ extern "C" int pgpu_moe_layer(float *out, const float *x, int D, int moe_inter,
     if (ensure((void **)&g_deo,  &g_deo_cap,  (size_t)D * 4)         != 0) return -1;
     if (ensure((void **)&g_dout, &g_dout_cap, (size_t)D * 4)         != 0) return -1;
 
-    if (cudaMemcpy(g_dx, x, (size_t)D * 4, cudaMemcpyHostToDevice) != cudaSuccess) return -1;
-    zero_k<<<(D + 127) / 128, 128>>>(g_dout, D);
+    if (stream_copy(g_dx, x, (size_t)D * 4, cudaMemcpyHostToDevice, "MoE input") != 0) return -1;
+    zero_k<<<(D + 127) / 128, 128, 0, g_compute_stream>>>(g_dout, D);
 
     /* Protect this call's already-resident experts from being evicted by the
      * misses in this same call: bump their LRU stamp before any upload evicts. */
@@ -597,24 +644,24 @@ extern "C" int pgpu_moe_layer(float *out, const float *x, int D, int moe_inter,
         const PgpuExpert *e = &experts[k];
         uint64_t key = ((uint64_t)(unsigned)layer << 32) | (unsigned)e->eid;
         DevExpert *de = get_expert(key, e, gu_wb, gu_sb, gu_bb, d_wb, d_sb, d_bb);
-        if (!de) return -1;
+        if (!de) { (void)stream_wait("MoE expert lookup failure"); return -1; }
         de->used = ++g_eclock;
 
         if (bits == 3)
-            expert_i3gs<<<(moe_inter + 127) / 128, 128>>>(de->gu, de->gu_s, g_dx, g_dgu, moe_inter, D);
+            expert_i3gs<<<(moe_inter + 127) / 128, 128, 0, g_compute_stream>>>(de->gu, de->gu_s, g_dx, g_dgu, moe_inter, D);
         else
-            expert_i4gs<<<(moe_inter + 127) / 128, 128>>>(de->gu, de->gu_s, g_dx, g_dgu, moe_inter, D, gs);
-        swiglu_k<<<(half + 127) / 128, 128>>>(g_dgu, de->gu_bias, g_dh, half,
+            expert_i4gs<<<(moe_inter + 127) / 128, 128, 0, g_compute_stream>>>(de->gu, de->gu_s, g_dx, g_dgu, moe_inter, D, gs);
+        swiglu_k<<<(half + 127) / 128, 128, 0, g_compute_stream>>>(g_dgu, de->gu_bias, g_dh, half,
                                               swiglu_clipped, swiglu_limit, swiglu_alpha);
         if (bits == 3)
-            expert_i3gs<<<(D + 127) / 128, 128>>>(de->d, de->d_s, g_dh, g_deo, D, half);
+            expert_i3gs<<<(D + 127) / 128, 128, 0, g_compute_stream>>>(de->d, de->d_s, g_dh, g_deo, D, half);
         else
-            expert_i4gs<<<(D + 127) / 128, 128>>>(de->d, de->d_s, g_dh, g_deo, D, half, gs);
-        accum_k<<<(D + 127) / 128, 128>>>(g_dout, g_deo, de->d_bias, wsum[k], D);
+            expert_i4gs<<<(D + 127) / 128, 128, 0, g_compute_stream>>>(de->d, de->d_s, g_dh, g_deo, D, half, gs);
+        accum_k<<<(D + 127) / 128, 128, 0, g_compute_stream>>>(g_dout, g_deo, de->d_bias, wsum[k], D);
     }
-    if (cudaGetLastError() != cudaSuccess) return -1;
-    if (cudaMemcpy(out, g_dout, (size_t)D * 4, cudaMemcpyDeviceToHost) != cudaSuccess) return -1;
-    return 0;
+    CU_TRY(cudaGetLastError());
+    CU_TRY(stream_copy(out, g_dout, (size_t)D * 4, cudaMemcpyDeviceToHost, "MoE output"));
+    return stream_wait("MoE layer");
 }
 
 extern "C" int pgpu_moe_resident(int layer, int eid) {

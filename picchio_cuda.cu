@@ -40,6 +40,11 @@ static uint64_t g_host_reg_align_fail = 0;
 static uint64_t g_host_reg_cap_fail = 0;
 static uint64_t g_host_reg_cuda_fail = 0;
 static uint64_t g_host_reg_bookkeeping_fail = 0;
+static uint64_t g_host_reg_attempts = 0;
+static uint64_t g_host_reg_attempt_bytes = 0;
+static uint64_t g_host_reg_cap_fail_bytes = 0;
+static size_t g_host_reg_min_attempt = (size_t)-1;
+static size_t g_host_reg_max_attempt = 0;
 static cudaError_t g_host_reg_last_cuda_error = cudaSuccess;
 static const size_t G_HOST_REG_LIMIT = (size_t)128 * 1024 * 1024;
 
@@ -278,6 +283,12 @@ extern "C" int pgpu_host_register(void *ptr, size_t bytes) {
     auto it = g_host_regs.find(ptr);
     if (it != g_host_regs.end()) return it->second >= bytes ? 1 : 0;
 
+    /* Record each new slab registration request to guide cap sizing. */
+    g_host_reg_attempts++;
+    g_host_reg_attempt_bytes += (uint64_t)bytes;
+    if (bytes < g_host_reg_min_attempt) g_host_reg_min_attempt = bytes;
+    if (bytes > g_host_reg_max_attempt) g_host_reg_max_attempt = bytes;
+
     /* flat_aligned_alloc currently returns 4 KiB-aligned slabs. Reject any
      * other pointer instead of asking CUDA to register an invalid range. */
     if (((uintptr_t)ptr & G_HOST_REG_ALIGN_MASK) != 0) {
@@ -288,6 +299,7 @@ extern "C" int pgpu_host_register(void *ptr, size_t bytes) {
     if (!host_reg_fits(g_host_reg_bytes, bytes)) {
         g_host_reg_fail++;
         g_host_reg_cap_fail++;
+        g_host_reg_cap_fail_bytes += (uint64_t)bytes;
         return 0;
     }
 
@@ -354,6 +366,13 @@ extern "C" void pgpu_shutdown(void) {
             (unsigned long long)g_host_reg_align_fail,
             (unsigned long long)g_host_reg_cuda_fail,
             (unsigned long long)g_host_reg_bookkeeping_fail);
+    if (g_host_reg_attempts > 0)
+        fprintf(stderr, "[gpu] pinned requests: %llu slabs, %.1f MiB total, min %.1f MiB, max %.1f MiB; cap-blocked %.1f MiB\\n",
+                (unsigned long long)g_host_reg_attempts,
+                g_host_reg_attempt_bytes / 1048576.0,
+                g_host_reg_min_attempt / 1048576.0,
+                g_host_reg_max_attempt / 1048576.0,
+                g_host_reg_cap_fail_bytes / 1048576.0);
     if (g_host_reg_last_cuda_error != cudaSuccess)
         fprintf(stderr, "[gpu] last cudaHostRegister error: %s\n",
                 cudaGetErrorString(g_host_reg_last_cuda_error));

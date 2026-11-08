@@ -367,7 +367,7 @@ extern "C" void pgpu_shutdown(void) {
             (unsigned long long)g_host_reg_cuda_fail,
             (unsigned long long)g_host_reg_bookkeeping_fail);
     if (g_host_reg_attempts > 0)
-        fprintf(stderr, "[gpu] pinned requests: %llu slabs, %.1f MiB total, min %.1f MiB, max %.1f MiB; cap-blocked %.1f MiB\\n",
+        fprintf(stderr, "[gpu] pinned requests: %llu slabs, %.1f MiB total, min %.1f MiB, max %.1f MiB; cap-blocked %.1f MiB\n",
                 (unsigned long long)g_host_reg_attempts,
                 g_host_reg_attempt_bytes / 1048576.0,
                 g_host_reg_min_attempt / 1048576.0,

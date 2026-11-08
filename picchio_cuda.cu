@@ -45,17 +45,17 @@ static int stream_wait(const char *where) {
     }
     return 0;
 }
-static int stream_copy(void *dst, const void *src, size_t bytes,
-                       cudaMemcpyKind kind, const char *where) {
+static cudaError_t stream_copy(void *dst, const void *src, size_t bytes,
+                              cudaMemcpyKind kind, const char *where) {
     cudaError_t e = cudaMemcpyAsync(dst, src, bytes, kind, g_compute_stream);
     if (e != cudaSuccess) {
         fprintf(stderr, "[gpu] %s async copy enqueue failed: %s\n",
                 where, cudaGetErrorString(e));
         (void)stream_wait(where);
         (void)cudaGetLastError();
-        return -1;
+        return e;
     }
-    return 0;
+    return cudaSuccess;
 }
 
 /* Bounded CUDA-pinned host slabs. Pageable memory remains the fallback. */

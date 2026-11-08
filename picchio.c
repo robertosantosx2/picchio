@@ -233,7 +233,7 @@ typedef struct {
     int64_t slab_cap;     /* allocated capacity */
     int64_t fslab_cap;
     int slab_reusable;    /* aligned SafeTensors cache storage, retained on eviction */
-    int slab_cuda_pinned; /* 1 after successful CUDA host registration; reset on free */
+    int slab_cuda_pinned; /* 0=pending, 1=registered, -1=failed; reset on free */
     uint64_t last_used;   /* timestamp for LRU eviction */
     int loading;          /* 1 = prefetch in progress on this slot (atomic) */
 } ESlot;
@@ -1336,7 +1336,7 @@ static void slot_wait_ready(ESlot *s) {
 
 static void free_slot_buffers(ESlot *s) {
     if (s->slab) {
-        if (s->slab_cuda_pinned && g_pgpu_host_unregister)
+        if (s->slab_cuda_pinned == 1 && g_pgpu_host_unregister)
             g_pgpu_host_unregister(s->slab);
         s->slab_cuda_pinned = 0;
         flat_aligned_free(s->slab); s->slab = NULL;
@@ -2257,11 +2257,11 @@ static void moe_forward(float *out, const float *x, Model *m,
                 es->gu.block_size <= 0 || es->gu.block_size != es->d.block_size) {
                 ok = 0; break;
             }
-            /* Register a reusable slab only once. A failed attempt is retried
-             * on a later token, while success avoids a mutex/map lookup per use. */
-            if (es->slab && !es->slab_cuda_pinned && g_pgpu_host_register)
+            /* Try each slab once. Remember failure until the slab is freed;
+             * successful registration avoids a mutex/map lookup on later tokens. */
+            if (es->slab && es->slab_cuda_pinned == 0 && g_pgpu_host_register)
                 es->slab_cuda_pinned =
-                    g_pgpu_host_register(es->slab, (size_t)es->slab_cap) ? 1 : 0;
+                    g_pgpu_host_register(es->slab, (size_t)es->slab_cap) ? 1 : -1;
             bs = es->gu.block_size;
             ge[k].gu_q4 = es->gu.q4; ge[k].gu_s = es->gu.s; ge[k].gu_bias = es->gu_bias;
             ge[k].d_q4  = es->d.q4;  ge[k].d_s  = es->d.s;  ge[k].d_bias  = es->d_bias;

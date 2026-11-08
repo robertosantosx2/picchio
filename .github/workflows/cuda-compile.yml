@@ -12,12 +12,17 @@ permissions:
 
 jobs:
   cuda-compile-sm86:
-    name: CUDA compile (sm_86, no GPU execution)
+    name: CUDA compile + CPU ABI checks (sm_86, no GPU execution)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+
+      - name: Build C engine and run CPU self-test
+        run: |
+          make -j2
+          ./picchio --self-test
 
       - name: Compile runtime shared library
         run: |
@@ -40,6 +45,13 @@ jobs:
             nvcc -std=c++14 -O2 -arch=sm_86 -DPGPU_ROUTER_TEST \
               -o /tmp/pgpu_router_test picchio_cuda.cu
 
+      - name: Compile stream-wait fail-stop fault-injection harness
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/workspace" -w /workspace \
+            nvidia/cuda:13.4.3-devel-ubuntu24.04 \
+            nvcc -std=c++14 -O2 -arch=sm_86 -DPGPU_STREAM_FAULT_TEST \
+              -o /tmp/pgpu_stream_fault_test picchio_cuda.cu
+
       - name: Verify explicit-stream invariants
         run: |
           python3 - <<'PY'
@@ -55,6 +67,10 @@ jobs:
           for token in ("cudaStreamCreateWithFlags", "cudaStreamSynchronize", "cudaMemcpyAsync"):
               if token not in source:
                   raise SystemExit("missing stream primitive: " + token)
+          if "PGPU_STREAM_FAULT_TEST" not in source or "pgpu_test_fail_next_stream_wait" not in source:
+              raise SystemExit("missing deterministic stream-wait fault-injection harness")
+          if "aborting to preserve host/device buffer ownership" not in source:
+              raise SystemExit("missing fail-stop ownership guard")
           print(f"explicit-stream static checks: PASS ({len(launches)} kernel launch sites)")
           PY
 

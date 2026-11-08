@@ -31,17 +31,44 @@
 static int   g_ok = 0;          /* 1 once a device is initialized */
 static char  g_name[256] = "";
 static cudaStream_t g_compute_stream = nullptr;
+#ifdef PGPU_STREAM_FAULT_TEST
+static int g_test_fail_next_stream_wait = 0;
+extern "C" void pgpu_test_fail_next_stream_wait(void) {
+    g_test_fail_next_stream_wait = 1;
+}
+#endif
 
 /* P1a keeps the public C API synchronous while making stream ordering explicit.
- * No host buffer or device allocation may be released before this stream drains. */
+ * A failed drain is fail-stop: returning to the C owner could let it recycle a
+ * host slab or free storage still referenced by queued CUDA work. Do not clear
+ * the CUDA error and continue with fallback/cleanup when completion is unknown. */
 static int stream_wait(const char *where) {
-    if (!g_compute_stream) return -1;
+    if (!g_compute_stream) {
+        if (g_ok) {
+            fprintf(stderr, "[gpu] FATAL: %s has no live compute stream\n", where);
+            fflush(stderr);
+            abort();
+        }
+        return 0; /* no stream was created, or shutdown already completed */
+    }
+#ifdef PGPU_STREAM_FAULT_TEST
+    if (g_test_fail_next_stream_wait) {
+        g_test_fail_next_stream_wait = 0;
+        fprintf(stderr,
+                "[gpu] FATAL: injected stream-wait failure at %s; "
+                "aborting to preserve host/device buffer ownership\n", where);
+        fflush(stderr);
+        abort();
+    }
+#endif
     cudaError_t e = cudaStreamSynchronize(g_compute_stream);
     if (e != cudaSuccess) {
-        fprintf(stderr, "[gpu] %s stream synchronize failed: %s\n",
+        fprintf(stderr,
+                "[gpu] FATAL: %s stream synchronize failed: %s; "
+                "aborting to preserve host/device buffer ownership\n",
                 where, cudaGetErrorString(e));
-        (void)cudaGetLastError();
-        return -1;
+        fflush(stderr);
+        abort();
     }
     return 0;
 }
@@ -352,7 +379,16 @@ extern "C" int pgpu_host_register(void *ptr, size_t bytes) {
     try {
         g_host_regs.emplace(ptr, bytes);
     } catch (...) {
-        (void)cudaHostUnregister(ptr);
+        cudaError_t undo = cudaHostUnregister(ptr);
+        if (undo != cudaSuccess) {
+            fprintf(stderr,
+                    "[gpu] FATAL: pinned-registration bookkeeping failed and "
+                    "cudaHostUnregister rollback also failed: %s; aborting "
+                    "to preserve host allocation ownership\n",
+                    cudaGetErrorString(undo));
+            fflush(stderr);
+            abort();
+        }
         g_host_reg_fail++;
         g_host_reg_bookkeeping_fail++;
         return 0;
@@ -372,10 +408,12 @@ extern "C" void pgpu_host_unregister(void *ptr) {
     (void)stream_wait("host unregister");
     cudaError_t e = cudaHostUnregister(ptr);
     if (e != cudaSuccess) {
-        fprintf(stderr, "[gpu] cudaHostUnregister failed: %s\n",
+        fprintf(stderr,
+                "[gpu] FATAL: cudaHostUnregister failed: %s; aborting because "
+                "the C owner must not free or recycle this slab\n",
                 cudaGetErrorString(e));
-        (void)cudaGetLastError();
-        return;
+        fflush(stderr);
+        abort();
     }
     g_host_reg_bytes -= it->second;
     g_host_regs.erase(it);
@@ -388,9 +426,12 @@ extern "C" void pgpu_shutdown(void) {
         for (auto &kv : g_host_regs) {
             cudaError_t e = cudaHostUnregister(kv.first);
             if (e != cudaSuccess) {
-                fprintf(stderr, "[gpu] shutdown cudaHostUnregister failed: %s\n",
+                fprintf(stderr,
+                        "[gpu] FATAL: shutdown cudaHostUnregister failed: %s; "
+                        "aborting before releasing any remaining resources\n",
                         cudaGetErrorString(e));
-                (void)cudaGetLastError();
+                fflush(stderr);
+                abort();
             }
         }
         g_host_regs.clear();
@@ -673,7 +714,43 @@ extern "C" int pgpu_moe_resident(int layer, int eid) {
 /* ══════════════════════════════════════════════════════════════════════════
  *  STANDALONE NUMERIC SELF-TEST + MICROBENCH (nvcc -DPGPU_TEST)
  * ══════════════════════════════════════════════════════════════════════════ */
-#if defined(PGPU_PINNED_TEST)
+#if defined(PGPU_STREAM_FAULT_TEST)
+int main(void) {
+    if (!pgpu_init()) {
+        fprintf(stderr, "no CUDA device; stream fault test skipped\n");
+        return 77;
+    }
+    const int E = 8, D = 64;
+    float *w = (float *)malloc((size_t)E * D * sizeof(float));
+    float *b = (float *)malloc((size_t)E * sizeof(float));
+    float *scores = (float *)malloc((size_t)E * sizeof(float));
+    float *x = nullptr;
+    if (!w || !b || !scores ||
+        posix_memalign((void **)&x, 4096, (size_t)D * sizeof(float)) != 0) {
+        fprintf(stderr, "fault-test allocation failed\n");
+        return 2;
+    }
+    for (int i = 0; i < E * D; i++) w[i] = 0.001f * (float)(i % 17);
+    for (int i = 0; i < E; i++) b[i] = 0.01f * (float)i;
+    for (int i = 0; i < D; i++) x[i] = 0.02f * (float)(i % 13);
+
+    if (!pgpu_host_register(x, (size_t)D * sizeof(float))) {
+        fprintf(stderr, "fault-test pinned host registration failed\n");
+        return 3;
+    }
+    if (pgpu_router_upload(w, b, E, D, w) != 0) {
+        fprintf(stderr, "fault-test router upload failed\n");
+        return 4;
+    }
+
+    /* router_scores queues pinned-host H2D, a kernel, and D2H. The injected
+     * failed drain must abort before this caller can unregister/free x. */
+    pgpu_test_fail_next_stream_wait();
+    (void)pgpu_router_scores(scores, x, w, b, E, D, w);
+    fprintf(stderr, "FAULT TEST FAIL: backend returned after failed drain\n");
+    return 5;
+}
+#elif defined(PGPU_PINNED_TEST)
 int main(void) {
     if (!pgpu_init()) { fprintf(stderr, "no CUDA device\n"); return 1; }
     void *p = nullptr;

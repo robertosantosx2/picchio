@@ -1343,7 +1343,7 @@ static void free_slot_buffers(ESlot *s) {
             if (!g_pgpu_host_unregister) {
                 fprintf(stderr,
                         "[gpu] FATAL: pinned expert slab has no unregister callback; "
-                        "aborting before host free\\n");
+                        "aborting before host free\n");
                 fflush(stderr);
                 abort();
             }

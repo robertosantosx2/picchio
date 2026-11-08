@@ -40,5 +40,23 @@ jobs:
             nvcc -std=c++14 -O2 -arch=sm_86 -DPGPU_ROUTER_TEST \
               -o /tmp/pgpu_router_test picchio_cuda.cu
 
+      - name: Verify explicit-stream invariants
+        run: |
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          source = Path("picchio_cuda.cu").read_text()
+          if re.search(r"\bcudaMemcpy\s*\(", source):
+              raise SystemExit("legacy synchronous cudaMemcpy call remains")
+          launches = [line.strip() for line in source.splitlines() if "<<<" in line]
+          bad = [line for line in launches if "g_compute_stream" not in line]
+          if bad:
+              raise SystemExit("kernel launch without explicit compute stream: " + repr(bad))
+          for token in ("cudaStreamCreateWithFlags", "cudaStreamSynchronize", "cudaMemcpyAsync"):
+              if token not in source:
+                  raise SystemExit("missing stream primitive: " + token)
+          print(f"explicit-stream static checks: PASS ({len(launches)} kernel launch sites)")
+          PY
+
       - name: Check patch whitespace
         run: git diff --check

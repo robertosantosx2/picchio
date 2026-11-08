@@ -56,7 +56,7 @@ static int stream_wait(const char *where) {
         g_test_fail_next_stream_wait = 0;
         fprintf(stderr,
                 "[gpu] FATAL: injected stream-wait failure at %s; "
-                "aborting to preserve host/device buffer ownership\\n", where);
+                "aborting to preserve host/device buffer ownership\n", where);
         fflush(stderr);
         abort();
     }
@@ -717,7 +717,7 @@ extern "C" int pgpu_moe_resident(int layer, int eid) {
 #if defined(PGPU_STREAM_FAULT_TEST)
 int main(void) {
     if (!pgpu_init()) {
-        fprintf(stderr, "no CUDA device; stream fault test skipped\\n");
+        fprintf(stderr, "no CUDA device; stream fault test skipped\n");
         return 77;
     }
     const int E = 8, D = 64;
@@ -727,7 +727,7 @@ int main(void) {
     float *x = nullptr;
     if (!w || !b || !scores ||
         posix_memalign((void **)&x, 4096, (size_t)D * sizeof(float)) != 0) {
-        fprintf(stderr, "fault-test allocation failed\\n");
+        fprintf(stderr, "fault-test allocation failed\n");
         return 2;
     }
     for (int i = 0; i < E * D; i++) w[i] = 0.001f * (float)(i % 17);
@@ -735,11 +735,11 @@ int main(void) {
     for (int i = 0; i < D; i++) x[i] = 0.02f * (float)(i % 13);
 
     if (!pgpu_host_register(x, (size_t)D * sizeof(float))) {
-        fprintf(stderr, "fault-test pinned host registration failed\\n");
+        fprintf(stderr, "fault-test pinned host registration failed\n");
         return 3;
     }
     if (pgpu_router_upload(w, b, E, D, w) != 0) {
-        fprintf(stderr, "fault-test router upload failed\\n");
+        fprintf(stderr, "fault-test router upload failed\n");
         return 4;
     }
 
@@ -747,7 +747,7 @@ int main(void) {
      * failed drain must abort before this caller can unregister/free x. */
     pgpu_test_fail_next_stream_wait();
     (void)pgpu_router_scores(scores, x, w, b, E, D, w);
-    fprintf(stderr, "FAULT TEST FAIL: backend returned after failed drain\\n");
+    fprintf(stderr, "FAULT TEST FAIL: backend returned after failed drain\n");
     return 5;
 }
 #elif defined(PGPU_PINNED_TEST)

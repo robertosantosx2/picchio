@@ -42,14 +42,19 @@ PGPU_API int  pgpu_init(void);
 /* 1 if pgpu_init succeeded and the GPU path is active; 0 otherwise. */
 PGPU_API int  pgpu_available(void);
 
-/* Free all device buffers, pinned host registrations and the resident-weight cache. */
+/* Free all device buffers, pinned host registrations and the resident-weight cache.
+ * If stream completion or host unregistration cannot be confirmed, the backend
+ * fail-stops (aborts) rather than returning while resources may still be in use. */
 PGPU_API void pgpu_shutdown(void);
 
 /* Optional pageable-to-pinned registration for reusable host expert slabs.
  * The pointer must be 4 KiB aligned; the backend enforces a 128 MiB aggregate
  * cap and returns 0 on failure so the caller can retain pageable memory.
  * Repeated registration of the same pointer is idempotent. Unregister must be
- * called before the owning host allocation is freed. Copies remain synchronous. */
+ * called before the owning host allocation is freed. Copies remain synchronous.
+ * If stream drain or cudaHostUnregister fails, the backend aborts before this
+ * function returns; callers must not free/recycle the slab after an uncertain
+ * unregister. This fail-stop policy protects the host owner's allocation. */
 PGPU_API int  pgpu_host_register(void *ptr, size_t bytes);
 PGPU_API void pgpu_host_unregister(void *ptr);
 

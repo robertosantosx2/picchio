@@ -31,6 +31,12 @@
 static int   g_ok = 0;          /* 1 once a device is initialized */
 static char  g_name[256] = "";
 static cudaStream_t g_compute_stream = nullptr;
+#ifdef PGPU_STREAM_FAULT_TEST
+static int g_test_fail_next_stream_wait = 0;
+extern "C" void pgpu_test_fail_next_stream_wait(void) {
+    g_test_fail_next_stream_wait = 1;
+}
+#endif
 
 /* P1a keeps the public C API synchronous while making stream ordering explicit.
  * A failed drain is fail-stop: returning to the C owner could let it recycle a
@@ -45,6 +51,16 @@ static int stream_wait(const char *where) {
         }
         return 0; /* no stream was created, or shutdown already completed */
     }
+#ifdef PGPU_STREAM_FAULT_TEST
+    if (g_test_fail_next_stream_wait) {
+        g_test_fail_next_stream_wait = 0;
+        fprintf(stderr,
+                "[gpu] FATAL: injected stream-wait failure at %s; "
+                "aborting to preserve host/device buffer ownership\\n", where);
+        fflush(stderr);
+        abort();
+    }
+#endif
     cudaError_t e = cudaStreamSynchronize(g_compute_stream);
     if (e != cudaSuccess) {
         fprintf(stderr,
@@ -698,7 +714,43 @@ extern "C" int pgpu_moe_resident(int layer, int eid) {
 /* ══════════════════════════════════════════════════════════════════════════
  *  STANDALONE NUMERIC SELF-TEST + MICROBENCH (nvcc -DPGPU_TEST)
  * ══════════════════════════════════════════════════════════════════════════ */
-#if defined(PGPU_PINNED_TEST)
+#if defined(PGPU_STREAM_FAULT_TEST)
+int main(void) {
+    if (!pgpu_init()) {
+        fprintf(stderr, "no CUDA device; stream fault test skipped\\n");
+        return 77;
+    }
+    const int E = 8, D = 64;
+    float *w = (float *)malloc((size_t)E * D * sizeof(float));
+    float *b = (float *)malloc((size_t)E * sizeof(float));
+    float *scores = (float *)malloc((size_t)E * sizeof(float));
+    float *x = nullptr;
+    if (!w || !b || !scores ||
+        posix_memalign((void **)&x, 4096, (size_t)D * sizeof(float)) != 0) {
+        fprintf(stderr, "fault-test allocation failed\\n");
+        return 2;
+    }
+    for (int i = 0; i < E * D; i++) w[i] = 0.001f * (float)(i % 17);
+    for (int i = 0; i < E; i++) b[i] = 0.01f * (float)i;
+    for (int i = 0; i < D; i++) x[i] = 0.02f * (float)(i % 13);
+
+    if (!pgpu_host_register(x, (size_t)D * sizeof(float))) {
+        fprintf(stderr, "fault-test pinned host registration failed\\n");
+        return 3;
+    }
+    if (pgpu_router_upload(w, b, E, D, w) != 0) {
+        fprintf(stderr, "fault-test router upload failed\\n");
+        return 4;
+    }
+
+    /* router_scores queues pinned-host H2D, a kernel, and D2H. The injected
+     * failed drain must abort before this caller can unregister/free x. */
+    pgpu_test_fail_next_stream_wait();
+    (void)pgpu_router_scores(scores, x, w, b, E, D, w);
+    fprintf(stderr, "FAULT TEST FAIL: backend returned after failed drain\\n");
+    return 5;
+}
+#elif defined(PGPU_PINNED_TEST)
 int main(void) {
     if (!pgpu_init()) { fprintf(stderr, "no CUDA device\n"); return 1; }
     void *p = nullptr;

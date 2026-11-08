@@ -36,7 +36,18 @@ static std::mutex g_host_reg_mutex;
 static std::unordered_map<void *, size_t> g_host_regs;
 static size_t g_host_reg_bytes = 0, g_host_reg_peak_bytes = 0;
 static uint64_t g_host_reg_ok = 0, g_host_reg_fail = 0;
+static uint64_t g_host_reg_align_fail = 0;
+static uint64_t g_host_reg_cap_fail = 0;
+static uint64_t g_host_reg_cuda_fail = 0;
+static uint64_t g_host_reg_bookkeeping_fail = 0;
+static cudaError_t g_host_reg_last_cuda_error = cudaSuccess;
 static const size_t G_HOST_REG_LIMIT = (size_t)128 * 1024 * 1024;
+
+/* Overflow-safe aggregate pinned-memory budget check. */
+static int host_reg_fits(size_t used, size_t bytes) {
+    return used <= G_HOST_REG_LIMIT &&
+           bytes <= G_HOST_REG_LIMIT - used;
+}
 static const uintptr_t G_HOST_REG_ALIGN_MASK = (uintptr_t)4095;
 
 #define CU_TRY(call) do {                                            \
@@ -269,15 +280,22 @@ extern "C" int pgpu_host_register(void *ptr, size_t bytes) {
 
     /* flat_aligned_alloc currently returns 4 KiB-aligned slabs. Reject any
      * other pointer instead of asking CUDA to register an invalid range. */
-    if (((uintptr_t)ptr & G_HOST_REG_ALIGN_MASK) != 0 ||
-        bytes > G_HOST_REG_LIMIT - g_host_reg_bytes) {
+    if (((uintptr_t)ptr & G_HOST_REG_ALIGN_MASK) != 0) {
         g_host_reg_fail++;
+        g_host_reg_align_fail++;
+        return 0;
+    }
+    if (!host_reg_fits(g_host_reg_bytes, bytes)) {
+        g_host_reg_fail++;
+        g_host_reg_cap_fail++;
         return 0;
     }
 
     cudaError_t e = cudaHostRegister(ptr, bytes, cudaHostRegisterPortable);
     if (e != cudaSuccess) {
         g_host_reg_fail++;
+        g_host_reg_cuda_fail++;
+        g_host_reg_last_cuda_error = e;
         (void)cudaGetLastError(); /* clear the runtime's sticky error state */
         return 0;                 /* caller keeps using pageable memory */
     }
@@ -288,6 +306,7 @@ extern "C" int pgpu_host_register(void *ptr, size_t bytes) {
     } catch (...) {
         (void)cudaHostUnregister(ptr);
         g_host_reg_fail++;
+        g_host_reg_bookkeeping_fail++;
         return 0;
     }
     g_host_reg_bytes += bytes;
@@ -330,6 +349,14 @@ extern "C" void pgpu_shutdown(void) {
     fprintf(stderr, "[gpu] pinned host slabs: %llu registered, %llu failed, peak %.1f MiB / 128 MiB cap\n",
             (unsigned long long)g_host_reg_ok, (unsigned long long)g_host_reg_fail,
             g_host_reg_peak_bytes / 1048576.0);
+    fprintf(stderr, "[gpu] pinned failures: cap=%llu align=%llu cuda=%llu bookkeeping=%llu\n",
+            (unsigned long long)g_host_reg_cap_fail,
+            (unsigned long long)g_host_reg_align_fail,
+            (unsigned long long)g_host_reg_cuda_fail,
+            (unsigned long long)g_host_reg_bookkeeping_fail);
+    if (g_host_reg_last_cuda_error != cudaSuccess)
+        fprintf(stderr, "[gpu] last cudaHostRegister error: %s\n",
+                cudaGetErrorString(g_host_reg_last_cuda_error));
     if (g_emiss + g_ehit > 0)
         fprintf(stderr, "[gpu] expert VRAM cache: %llu hit / %llu miss (%.1f%%), %.2f GB resident\n",
                 (unsigned long long)g_ehit, (unsigned long long)g_emiss,

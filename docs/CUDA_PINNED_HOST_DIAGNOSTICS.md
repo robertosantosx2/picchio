@@ -88,7 +88,7 @@ not validate CUDA runtime behavior or the target GPU.
 ### Target GPU checks (must eventually run on RTX 3050)
 
 1. Build the current CUDA source into a separate diagnostic shared library.
-2. Run the pinned-host standalone self-test on a CUDA-capable device.
+2. Run the pinned-host standalone self-test on a CUDA-capable device. It checks registration/idempotence/unregister behavior, pointer alignment, the exact 128 MiB budget boundary, over-cap and exhausted-budget cases, and overflow-safe size handling.
 3. Run one eight-token diagnostic with the new request-size counters.
 4. Use those request sizes to choose a small cap matrix; do not assume 192/256/
    384 MiB is safe until host-memory headroom is checked.

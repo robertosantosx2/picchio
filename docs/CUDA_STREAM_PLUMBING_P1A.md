@@ -1,6 +1,6 @@
 # CUDA stream plumbing: P1a audit and implementation contract
 
-**Status:** design/audit only; no stream-plumbing code has been merged or hardware-validated.
+**Status:** design/audit plus experimental implementation in PR #5; not merged. Initial target-GPU smoke tests passed, but cross-layer error-path ownership remains a blocking defect.
 **Parent:** `feature/cuda-pinned-host-slabs` (PR #1).
 **Scope:** one explicit CUDA stream while preserving the current synchronous C ABI.
 **Non-goal:** overlap, prefetch, concurrent expert uploads, or performance claims.
@@ -48,11 +48,13 @@ buffer while queued work can still reference it.
 3. Every H2D and D2H transfer is enqueued on that same stream. A helper should
    report enqueue failures and drain already queued work before the caller
    releases any borrowed host pointer.
-4. Every public operation that borrows host memory synchronizes before returning,
-   including error/fallback returns after any transfer has been enqueued.
+4. Every public operation that borrows host memory must synchronize before returning,
+   including error/fallback returns after any transfer has been enqueued. PR #5 does
+   not yet satisfy this on all error paths.
 5. Expert host slabs cannot be unregistered, recycled, or freed while a queued
    transfer might still read them. P1a's synchronous API boundary is the lease:
-   it must be upheld on every exit path.
+   it must be upheld on every exit path. The current void unregister ABI does not
+   let the C owner know whether unregister/drain succeeded.
 6. LRU eviction cannot free a device expert still referenced by queued kernels.
    Drain the stream before freeing an eviction victim unless a later event/lease
    mechanism proves a narrower safe boundary.
@@ -103,3 +105,44 @@ Only after these gates pass should P1b introduce a separate upload stream,
 completion events, per-expert UPLOADING state, host DMA leases, and eviction
 protection. P1a must not claim speedup: the required stream synchronization at
 each API boundary intentionally preserves the current serialization contract.
+
+
+## Implementation audit addendum — 2026-11-08
+
+PR #5 implements the explicit compute stream, asynchronous copies, and explicit
+kernel stream arguments. Hosted compile/static checks passed. On the MSI RTX
+3050, `PGPU_PINNED_TEST` passed and `PGPU_ROUTER_TEST` passed twice (CPU/GPU
+top-1 matched; max absolute error 7.629395e-06). These are limited smoke tests,
+not full runtime or failure-path validation.
+
+A source-level cross-layer audit then found that the error-path invariants above
+are not yet met:
+
+- `pgpu_host_unregister()` discards a failed `stream_wait()`.
+- The function returns `void`; `picchio.c:free_slot_buffers()` unconditionally
+  clears the pinned state and calls `flat_aligned_free()` after the callback.
+  Returning early in CUDA alone would therefore not protect the host slab.
+- `pgpu_shutdown()` discards the drain result and proceeds to unregister host
+  memory, free device caches/scratch, and destroy the stream.
+- `stream_copy()` and `CU_TRY` ignore recovery-wait results. Partial upload
+  cleanup in lm-head/router/expert paths can free allocations without a
+  confirmed safe completion boundary.
+- `ensure()` releases old scratch allocations during resize; its safety depends
+  on the backend's error state being known-good.
+- `get_expert()` checks the wait before normal LRU eviction, but ignores the
+  wait result before freeing a partially uploaded expert.
+
+The public C API currently has no explicit poisoned-backend state or teardown
+status channel. The host owner must participate in the policy: a backend-only
+early return is insufficient because the C caller will still free/recycle the
+slab.
+
+**Required remediation:** define a backend poison/fail-stop policy; propagate
+unregister and teardown outcomes across the C ABI; make the host owner retain
+or deliberately fail-stop rather than free a slab after failed unregister;
+apply the same policy to partial device uploads, scratch resizing, CPU fallback,
+and shutdown; and add deterministic stream-wait fault-injection tests.
+
+Until that work and its tests exist, PR #5 remains Draft and must not be
+approved or merged. The two successful target-GPU smoke tests do not close this
+gate.

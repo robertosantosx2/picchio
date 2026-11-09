@@ -1,7 +1,7 @@
 # Picchio MoE — Global Engineering Improvement Proposal
 
 **Status:** proposal for maintainer discussion; not an implementation claim.  
-**Scope:** a staged, evidence-led roadmap for improving Picchio's ability to run large sparse MoE models on machines with constrained RAM and VRAM, while preserving correctness, portability, and predictable failure behaviour.
+**Scope:** a staged, evidence-led roadmap for improving Picchio's ability to run large sparse MoE models on machines with constrained RAM and VRAM (o no GPU), while preserving correctness, portability, and predictable failure behaviour.
 
 ## 1. Goals and guiding principles
 
